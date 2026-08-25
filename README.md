@@ -2,21 +2,29 @@
 
 Asymmetric **split-grid** serialization for rectangular numeric and mixed-type grids.
 
-This package was **pulled out of [WriterAgent](https://github.com/KeithCu/writeragent)** (LibreOffice Writer/Calc/Draw AI extension). It is the same host flatten + child unpack codec that lived in `plugin.scripting.payload_codec`, plus the optional Cython flatten accelerator from `native/writeragent_vec`. WriterAgent can later depend on `splitgrid` without changing the wire dict.
+This package was **pulled out of [WriterAgent](https://github.com/KeithCu/writeragent)** (LibreOffice Writer/Calc/Draw AI extension). It is the host flatten + child unpack codec that lived in `plugin.scripting.payload_codec`, plus the optional Cython flatten accelerator from `native/writeragent_vec`.
 
-Repo: [github.com/KeithCu/writeragent](https://github.com/KeithCu/writeragent)
+## Why this exists
 
-## What split-grid is
+A spreadsheet host often cannot import NumPy: LibreOffice’s embedded Python is a different interpreter from the user’s venv, and loading the user’s C extensions into the host is an ABI footgun. Heavy compute therefore runs in a **child** process that *does* have NumPy. The range still has to cross that boundary.
 
-The compute path is **asymmetric by design**:
+On the wire, a Calc-style range is a nested list: `list[list[float | int | str | None]]`. Standard pickle walks **one heap object per cell**. On a 20,000 × 5 grid that is ~12 ms for dump + load. Pack the same numbers into a contiguous `float64` buffer and Pickle Protocol 5 moves the bytes in ~0.015 ms; the child can `np.frombuffer` in ~0.002 ms.
 
-- **Host pack** (LibreOffice’s embedded Python, or any NumPy-free interpreter) flattens a 1D or 2D grid into a contiguous `float64` buffer plus a sparse **integer-keyed** `strings` map. Empty cells become `NaN`. Zip codes like `"02138"` stay strings — they are never parsed as floats.
-- **Child unpack** (venv with NumPy) materializes a **pure-numeric** grid (`strings == {}`) with `np.frombuffer` (ndarray). Mixed grids use a vectorized object-masking path and return nested lists, restoring `None` for NaN holes.
-- **Host unpack** preserves `float('nan')` from the buffer (does **not** coerce holes to `None`). That is the locked egress policy: NaN becomes a Calc error, not a silent blank.
+Almost all of the remaining time is **host flatten** — turning nested Python objects into that buffer without NumPy (~8.3 ms pure Python on that shape; ~3 ms with the Cython helper). SplitGrid is that flatten/unpack. Length-prefixed Pickle 5 framing stays in the application; this package is the codec only.
+
+Column-wise blobs and JSON + Base64 were tried first. Transposing columns on the host builds extra object graphs; Base64 and per-column reconstructs lose the `frombuffer` win. One row-major float64 buffer plus a sparse string map is faster and simpler.
+
+## How it works
+
+The path is **asymmetric**:
+
+- **Host pack** (stdlib only) flattens a 1D or 2D rectangular grid into a contiguous `float64` buffer plus a sparse **integer-keyed** `strings` map. Empty cells become `NaN`. Zip codes like `"02138"` stay strings — they are never parsed as floats.
+- **Child unpack** (NumPy) materializes a **pure-numeric** grid (`strings == {}`) with `np.frombuffer` (ndarray). Mixed grids use a vectorized object-masking path and return nested lists, restoring `None` for NaN holes.
+- **Host unpack** preserves `float('nan')` from the buffer (does **not** coerce holes to `None`). That is the locked egress policy: NaN becomes a spreadsheet error, not a silent blank.
 
 Grids with fewer than **100 cells** (`BINARY_MIN_CELLS`) stay nested Python lists. Force `"always"` / `"never"` overrides that threshold (used by A/B tests).
 
-Wire envelope (Pickle5-friendly dict, same keys as WriterAgent):
+Wire envelope (Pickle5-friendly dict):
 
 ```python
 {
@@ -29,9 +37,30 @@ Wire envelope (Pickle5-friendly dict, same keys as WriterAgent):
 }
 ```
 
+| Cell value | `buffer` (float64) | `strings` |
+|------------|--------------------|-----------|
+| `None` (empty cell) | `NaN` | — |
+| `int` / `float` | numeric value | — |
+| `bool` | `0.0` / `1.0` | — |
+| `str` (including `"02138"`) | `NaN` | text by flat index |
+
 There is **no datetime lane** on the float64 buffer. Python `datetime` objects stringify into `strings`. Do not add a `'date'` column kind.
 
-Jagged 2D grids raise `ValueError` (Calc ranges are rectangular).
+Jagged 2D grids raise `ValueError` (spreadsheet ranges are rectangular).
+
+## Numbers
+
+Median timings from an asymmetric bench (host = stdlib pack; child = deserialize + materialize).
+
+Ingress, **20,000 × 5** (100k cells):
+
+| Format | Pack | Dump | Load | Materialize | Total |
+|--------|------|------|------|-------------|-------|
+| JSON nested lists | 6.2 ms | 22.8 ms | 14.6 ms | 2.1 ms | 45.7 ms |
+| Pickle 5 nested lists | 6.1 ms | 1.4 ms | 2.9 ms | 2.0 ms | 12.4 ms |
+| **Pickle 5 + split-grid** | 8.3 ms | **0.013 ms** | **0.015 ms** | **0.002 ms** | **8.3 ms** |
+
+Child materialize of a **100 × 100** numeric grid: nested-list pickle then `np.array` ~0.6 ms; split-grid `frombuffer` ~**0.016 ms**. Below 100 cells the envelope is not worth it — that is why `BINARY_MIN_CELLS` exists. Host pack still dominates large ingress; Cython only speeds that loop.
 
 ## Python vs Cython
 
@@ -73,7 +102,7 @@ make verify             # deal contracts + hypothesis round-trips, no CrossHair
 
 Default pytest **does not require** the compiled extension. When `splitgrid.pack` is built, `tests/test_cython_parity.py` compares Cython and Python flatten components on the same grids.
 
-## Public API (WriterAgent-compatible)
+## Public API
 
 ```python
 from splitgrid import (
@@ -94,10 +123,6 @@ from splitgrid import (
 
 `host_pack_data(..., force="auto"|"always"|"never")` chooses split-grid vs nested list. `host_pack_multi_data` is a thin `multi_data` wrapper over the same per-grid packing.
 
-## How WriterAgent will consume this
-
-In [WriterAgent](https://github.com/KeithCu/writeragent), replace `from plugin.scripting.payload_codec import host_pack_data, ...` with `from splitgrid import host_pack_data, ...`. The envelope tag stays `"split_grid"`, dtype `"float64"`, integer-keyed `strings`, and `column_kinds` `int`/`float`/`bool`. Pickle Protocol 5 framing stays in WriterAgent’s `ipc.py` — this package is the codec only.
-
 ## License
 
-GPL-3.0-or-later (same as WriterAgent).
+GPL-3.0-or-later.
