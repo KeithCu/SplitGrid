@@ -98,12 +98,6 @@ from splitgrid import (
 
 In [WriterAgent](https://github.com/KeithCu/writeragent), replace `from plugin.scripting.payload_codec import host_pack_data, ...` with `from splitgrid import host_pack_data, ...`. The envelope tag stays `"split_grid"`, dtype `"float64"`, integer-keyed `strings`, and `column_kinds` `int`/`float`/`bool`. Pickle Protocol 5 framing stays in WriterAgent’s `ipc.py` — this package is the codec only.
 
-## Releasing
-
-Pushing `main` or a `v*` tag only **builds** wheels and an sdist (`.github/workflows/build.yml`). Nothing is uploaded.
-
-To publish: Actions → **Publish** → **Run workflow**, and choose the tag (for example `v0.1.0`). That rebuilds, then trusted-publishes to PyPI (`publish.yml`, environment `pypi`, no API token). The workflow file must already be on `main`.
-
 ## License
 
 GPL-3.0-or-later (same as WriterAgent).
