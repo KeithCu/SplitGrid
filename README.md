@@ -100,7 +100,9 @@ In [WriterAgent](https://github.com/KeithCu/writeragent), replace `from plugin.s
 
 ## Releasing
 
-Tags matching `v*` (for example `v0.1.0`) run `.github/workflows/publish.yml`: cibuildwheel + sdist, then trusted publishing to PyPI (GitHub environment `pypi`, no API token). The workflow file must already be on `main` before you push the tag.
+Pushing `main` or a `v*` tag only **builds** wheels and an sdist (`.github/workflows/build.yml`). Nothing is uploaded.
+
+To publish: Actions → **Publish** → **Run workflow**, and choose the tag (for example `v0.1.0`). That rebuilds, then trusted-publishes to PyPI (`publish.yml`, environment `pypi`, no API token). The workflow file must already be on `main`.
 
 ## License
 
