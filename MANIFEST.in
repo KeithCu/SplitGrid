@@ -1,0 +1,7 @@
+include src/splitgrid/*.pyx
+include src/splitgrid/*.pxd
+include setup.py
+include pyproject.toml
+include LICENSE
+include README.md
+include Makefile

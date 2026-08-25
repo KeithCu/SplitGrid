@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "cython>=3.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splitgrid"
+version = "0.1.0"
+description = "Asymmetric split-grid serialization: host stdlib flatten + optional Cython, child NumPy unpack"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "GPL-3.0-or-later"}
+authors = [
+    {name = "Keith Cu", email = "keithcu@gmail.com"}
+]
+keywords = ["serialization", "numpy", "spreadsheet", "split-grid", "cython"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Cython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+test = ["pytest", "hypothesis", "deal", "numpy"]
+verify = ["crosshair-tool"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+splitgrid = ["*.pyx", "*.pxd"]
+
+[tool.cibuildwheel]
+# Build only Python 3.11-3.14 (same policy as WriterAgent writeragent_vec).
+build = "cp311-* cp312-* cp313-* cp314-*"
+
+# Skip 32-bit builds and musl entirely
+skip = "*-win32 *-manylinux_i686 *-musllinux_*"
+
+# Environment variables for the build (generic x86-64, not v3)
+environment = { WRITERAGENT_ARCH="x86-64", SPLITGRID_ARCH="x86-64" }
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+manylinux-x86_64-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
+
+[tool.cibuildwheel.macos]
+archs = ["universal2"]
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64", "ARM64"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m \"not slow\""
+markers = [
+    "slow: excluded from default pytest; run with pytest -m slow or make test-slow",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
