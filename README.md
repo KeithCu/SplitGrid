@@ -72,7 +72,7 @@ Host flatten is an optimized **pure-Python** loop:
 - lazy column-state upgrades
 - rectangular validation before the hot loop
 
-The optional **Cython** module `splitgrid.pack` exposes `fast_flatten_grid_1d` / `fast_flatten_grid_2d`. It is loaded dynamically and **canary-tested** at import. If the extension is missing or fails the canary, the codec uses pure Python. Importing `splitgrid` never requires a compiler.
+The optional **Cython** module `splitgrid.pack` exposes `fast_flatten_grid_1d` / `fast_flatten_grid_2d`. It is loaded dynamically and **canary-tested** at import. If the extension is missing or fails the canary, the codec uses pure Python. Importing `splitgrid` never requires a compiler. Extension builds use release flags (`-O3 -DNDEBUG -g0` on Unix, `/O2 /DNDEBUG` on Windows).
 
 ## Install
 

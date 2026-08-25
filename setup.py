@@ -10,9 +10,10 @@ system = platform.system()
 machine = platform.machine().lower()
 
 if system == "Windows":
-    extra_compile_args.append("/O2")
+    extra_compile_args.extend(["/O2", "/DNDEBUG"])
 else:
-    extra_compile_args.append("-O3")
+    # -g0 overrides manylinux/CPython default -g so wheels are not full of debug symbols.
+    extra_compile_args.extend(["-O3", "-DNDEBUG", "-g0"])
 
 # Only apply SPLITGRID_ARCH / WRITERAGENT_ARCH logic on Linux x86_64.
 # Generic x86-64 (not v3): flatten is memory-bound; SIMD floors buy ~1%.
