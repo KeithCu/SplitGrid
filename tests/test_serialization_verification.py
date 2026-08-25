@@ -186,7 +186,9 @@ def test_host_pack_multi_data_structure_and_roundtrip() -> None:
     assert envelope.get("__wa_payload__") == PAYLOAD_MULTI_DATA
     items = envelope["items"]
     assert len(items) == len(grids)
-    assert all(is_split_grid(item) for item in items)
+    # host_pack_data skips falsy/empty grids even with force="always"
+    assert items[0] == []
+    assert all(is_split_grid(item) for item in items[1:])
 
     unpacked = host_unpack_data(envelope)
     assert isinstance(unpacked, list)

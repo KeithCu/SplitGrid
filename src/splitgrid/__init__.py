@@ -33,8 +33,6 @@ from splitgrid.codec import (
     describe_wire_value,
     envelope_column_kinds,
     envelope_uniform_column_kind,
-    fast_flatten_grid_1d,
-    fast_flatten_grid_2d,
     get_cython_status_info,
     grid_from_nested_list,
     host_cython_status_line,
@@ -58,6 +56,15 @@ from splitgrid.codec import (
 )
 
 __version__ = "0.1.0"
+
+
+def __getattr__(name: str):
+    """Bind accelerator function names to codec globals (may be None until load)."""
+    if name in ("fast_flatten_grid_1d", "fast_flatten_grid_2d"):
+        from splitgrid import codec as _codec
+
+        return getattr(_codec, name)
+    raise AttributeError(f"module 'splitgrid' has no attribute {name!r}")
 
 __all__ = [
     "BINARY_MIN_CELLS",

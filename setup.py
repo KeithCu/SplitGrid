@@ -30,20 +30,25 @@ extensions = [
 
 
 class OptionalBuildExt(_build_ext):
-    """Build the Cython flatten accelerator when a compiler is present.
+    """Build the Cython flatten accelerator when a compiler and Python headers exist.
 
-    Missing compiler / Cython must not fail ``pip install``: the codec falls
-    back to the proven pure-Python flatten.
+    Missing compiler / headers / Cython must not fail ``pip install``: the codec
+    falls back to the proven pure-Python flatten.
     """
 
-    def build_extension(self, ext):
-        try:
-            super().build_extension(ext)
-        except Exception as exc:  # pragma: no cover - environment dependent
-            sys.stderr.write(
-                f"WARNING: splitgrid Cython accelerator not built ({ext.name}): {exc}\n"
-                "         Pure-Python flatten will be used.\n"
-            )
+    def build_extensions(self):
+        self.check_extensions_list(self.extensions)
+        surviving = []
+        for ext in self.extensions:
+            try:
+                self.build_extension(ext)
+                surviving.append(ext)
+            except Exception as exc:  # pragma: no cover - environment dependent
+                sys.stderr.write(
+                    f"WARNING: splitgrid Cython accelerator not built ({ext.name}): {exc}\n"
+                    "         Pure-Python flatten will be used.\n"
+                )
+        self.extensions = surviving
 
 
 def _ext_modules():
