@@ -2,7 +2,9 @@
 
 Asymmetric **split-grid** serialization for rectangular numeric and mixed-type grids.
 
-This package is the extract of WriterAgent’s proven host flatten + child unpack codec (`plugin.scripting.payload_codec`) and optional Cython flatten accelerator (`native/writeragent_vec`). WriterAgent can later depend on `splitgrid` without changing the wire dict.
+This package was **pulled out of [WriterAgent](https://github.com/KeithCu/writeragent)** (LibreOffice Writer/Calc/Draw AI extension). It is the same host flatten + child unpack codec that lived in `plugin.scripting.payload_codec`, plus the optional Cython flatten accelerator from `native/writeragent_vec`. WriterAgent can later depend on `splitgrid` without changing the wire dict.
+
+Repo: [github.com/KeithCu/writeragent](https://github.com/KeithCu/writeragent)
 
 ## What split-grid is
 
@@ -94,7 +96,7 @@ from splitgrid import (
 
 ## How WriterAgent will consume this
 
-Replace `from plugin.scripting.payload_codec import host_pack_data, ...` with `from splitgrid import host_pack_data, ...`. The envelope tag stays `"split_grid"`, dtype `"float64"`, integer-keyed `strings`, and `column_kinds` `int`/`float`/`bool`. Pickle Protocol 5 framing stays in WriterAgent’s `ipc.py` — this package is the codec only.
+In [WriterAgent](https://github.com/KeithCu/writeragent), replace `from plugin.scripting.payload_codec import host_pack_data, ...` with `from splitgrid import host_pack_data, ...`. The envelope tag stays `"split_grid"`, dtype `"float64"`, integer-keyed `strings`, and `column_kinds` `int`/`float`/`bool`. Pickle Protocol 5 framing stays in WriterAgent’s `ipc.py` — this package is the codec only.
 
 ## License
 
