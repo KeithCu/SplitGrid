@@ -27,6 +27,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/KeithCu/SplitGrid"
+Source = "https://github.com/KeithCu/SplitGrid"
+Issues = "https://github.com/KeithCu/SplitGrid/issues"
+"WriterAgent" = "https://github.com/KeithCu/writeragent"
+
 [project.optional-dependencies]
 numpy = ["numpy"]
 test = ["pytest", "hypothesis", "deal", "numpy"]

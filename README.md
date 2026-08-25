@@ -48,15 +48,15 @@ The optional **Cython** module `splitgrid.pack` exposes `fast_flatten_grid_1d` /
 ## Install
 
 ```bash
-# Runtime (pure Python; Cython built if a compiler is available)
+pip install splitgrid
+```
+
+PyPI wheels include the compiled Cython flatten accelerator. From a source checkout (Cython is built if a compiler is available):
+
+```bash
 pip install .
-
-# Editable + tests
-pip install -e ".[test]"
-
-# Optional extras
+pip install -e ".[test]"      # editable + pytest, hypothesis, deal, numpy
 pip install -e ".[numpy]"     # child unpack/pack
-pip install -e ".[test]"      # pytest, hypothesis, deal, numpy
 pip install -e ".[verify]"    # crosshair-tool
 ```
 
@@ -97,6 +97,10 @@ from splitgrid import (
 ## How WriterAgent will consume this
 
 In [WriterAgent](https://github.com/KeithCu/writeragent), replace `from plugin.scripting.payload_codec import host_pack_data, ...` with `from splitgrid import host_pack_data, ...`. The envelope tag stays `"split_grid"`, dtype `"float64"`, integer-keyed `strings`, and `column_kinds` `int`/`float`/`bool`. Pickle Protocol 5 framing stays in WriterAgent’s `ipc.py` — this package is the codec only.
+
+## Releasing
+
+Tags matching `v*` (for example `v0.1.0`) run `.github/workflows/publish.yml`: cibuildwheel + sdist, then trusted publishing to PyPI (GitHub environment `pypi`, no API token). The workflow file must already be on `main` before you push the tag.
 
 ## License
 
