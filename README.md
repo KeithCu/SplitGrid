@@ -1,5 +1,7 @@
 # SplitGrid
 
+[![PyPI](https://img.shields.io/pypi/v/splitgrid.svg)](https://pypi.org/project/splitgrid/)
+
 Asymmetric **split-grid** serialization for rectangular numeric and mixed-type grids.
 
 This package was **pulled out of [WriterAgent](https://github.com/KeithCu/writeragent)** (LibreOffice Writer/Calc/Draw AI extension). It is the host flatten + child unpack codec that lived in `plugin.scripting.payload_codec`, plus the optional Cython flatten accelerator from `native/writeragent_vec`.
@@ -101,6 +103,20 @@ make verify             # deal contracts + hypothesis round-trips, no CrossHair
 ```
 
 Default pytest **does not require** the compiled extension. When `splitgrid.pack` is built, `tests/test_cython_parity.py` compares Cython and Python flatten components on the same grids.
+
+## Bench
+
+Requires NumPy (and the optional Cython extension if you want the accelerated pack row). From a source checkout:
+
+```bash
+python scripts/bench_serialization.py --direction both
+python scripts/bench_serialization.py --child-only
+python scripts/bench_unpacking_opt.py
+python scripts/profile_pack.py
+python scripts/profile_nones.py
+python scripts/run_serialization_ab.py --all
+make bench
+```
 
 ## Public API
 
