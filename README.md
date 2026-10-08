@@ -42,13 +42,24 @@ Wire envelope (Pickle5-friendly dict):
 | Cell value | `buffer` (float64) | `strings` |
 |------------|--------------------|-----------|
 | `None` (empty cell) | `NaN` | — |
-| `int` / `float` | numeric value | — |
+| `int` / `float` that `float()` accepts | numeric value (ints past ±2^53 round) | — |
+| `int` that `float()` rejects (`10**400`) | `NaN` | decimal text |
 | `bool` | `0.0` / `1.0` | — |
 | `str` (including `"02138"`) | `NaN` | text by flat index |
+| Python `complex` or a NumPy complex scalar | `NaN` | `str(val)`; imaginary part kept |
 
-There is **no datetime lane** on the float64 buffer. Python `datetime` objects stringify into `strings`. Do not add a `'date'` column kind.
+Column kinds are `int`, `float`, or `bool`. A column that mixes bool and int is `int` (`True` and `1` are the same float64). A bool next to a float stays `float`. One kind for every column, and an empty `strings` map, is the `frombuffer` path; mixed kinds stay one float64 ndarray in the child. Host unpack still restores per-column Python types, and it keeps buffer `NaN` as `float('nan')`.
 
-Jagged 2D grids raise `ValueError` (spreadsheet ranges are rectangular).
+There is **no datetime lane** on the float64 buffer. Python `datetime` objects stringify into `strings`. `datetime64` / `timedelta64` ndarrays raise from `child_pack_split_grid` instead of becoming Unix-epoch units. Do not add a `'date'` column kind.
+
+Other 0.2.0 rules (detail in [docs/serialization.md](docs/serialization.md)):
+
+- Rank is 1 or 2. Rank 3+ packs as a list of planes.
+- Jagged 2D grids raise `ValueError`. A row that is not a list or tuple does too.
+- String-map keys must be integers. Two keys that stringify to the same index raise. `wire_str_key` raises on dict keys that collide when stringified.
+- Recursive pack, unpack, and `wire_cell_count` stop at depth 128.
+- A plain dict is walked so a nested envelope unpacks. `calc_range` unpacks the inner grid (no CalcRange wrapper).
+- Image envelopes can be found and written with `find_image_payloads` / `write_image_payload_to_temp`.
 
 ## Numbers
 
@@ -132,12 +143,17 @@ from splitgrid import (
     child_unpack_data,
     child_pack_result,
     is_split_grid,
+    find_image_payloads,
+    write_image_payload_to_temp,
+    wire_str_key,
     load_cython_accelerator,
     get_cython_status_info,
 )
 ```
 
 `host_pack_data(..., force="auto"|"always"|"never")` chooses split-grid vs nested list. `host_pack_multi_data` is a thin `multi_data` wrapper over the same per-grid packing.
+
+Wire contract: [docs/serialization.md](docs/serialization.md). Deal / CrossHair notes: [docs/serialization-verification.md](docs/serialization-verification.md).
 
 ## License
 

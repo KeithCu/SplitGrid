@@ -1,4 +1,4 @@
-# SplitGrid - tests (from WriterAgent)
+# SplitGrid
 # Copyright (c) 2026 KeithCu (modifications and relicensing)
 #
 # This program is free software: you can redistribute it and/or modify
@@ -19,7 +19,6 @@ from splitgrid.codec import (
     PAYLOAD_SPLIT_GRID,
     SPLIT_GRID_WIRE_DTYPE,
     _flatten_grid_to_components,
-    _host_cell_from_float,
     _apply_column_kinds_to_ndarray,
     envelope_column_kinds,
     envelope_uniform_column_kind,
@@ -28,6 +27,17 @@ from splitgrid.codec import (
     child_pack_split_grid,
     child_unpack_split_grid,
 )
+
+
+def _host_cell_from_float(val: float, *, kind: str) -> Any:
+    """Legacy b64 oracle: NaN becomes None, int columns become int.
+
+    Production unpack does not use this. The oracle is meant to drift from
+    the host path so a wire change shows up as a difference.
+    """
+    if math.isnan(val):
+        return None
+    return int(val) if kind == "int" else val
 
 
 def pickle5_roundtrip(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -105,6 +115,11 @@ def legacy_b64_host_pack_split_grid(grid: list[Any] | list[list[Any]]) -> dict[s
 
 
 def legacy_b64_host_unpack_split_grid(envelope: dict[str, Any]) -> list[Any] | list[list[Any]]:
+    """Old base64 decoder kept as the A/B baseline.
+
+    Do not call ``host_unpack_split_grid`` from here. This oracle is supposed
+    to drift from production so a wire change shows up as a difference.
+    """
     import array
 
     b64_str = envelope.get("b64", "")
@@ -173,9 +188,7 @@ def legacy_b64_child_unpack_split_grid(envelope: dict[str, Any]) -> Any:
         arr = np.frombuffer(raw, dtype=np.float64)
         if not is_1d:
             arr = arr.reshape((nrows, ncols))
-        return _apply_column_kinds_to_ndarray(
-            arr, column_kinds, ncols=ncols, is_1d=is_1d, uniform=uniform
-        )
+        return _apply_column_kinds_to_ndarray(arr, uniform=uniform)
 
     flat_list = np.frombuffer(raw, dtype=np.float64).tolist()
     for i, val in enumerate(flat_list):

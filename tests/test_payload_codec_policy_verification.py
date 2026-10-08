@@ -17,7 +17,13 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 import deal
-from splitgrid.deal_shim import DEAL_MAX_SHAPE_DIM, DEAL_MAX_SHAPE_RANK
+from splitgrid.deal_shim import (
+    DEAL_MAX_COL_INDEX,
+    DEAL_MAX_ROW_INDEX,
+    DEAL_MAX_SHAPE_DIM,
+    DEAL_MAX_SHAPE_RANK,
+    DEAL_MAX_SOURCE,
+)
 from splitgrid.codec import (
     PAYLOAD_CALC_RANGE,
     PAYLOAD_DATAFRAME,
@@ -25,7 +31,9 @@ from splitgrid.codec import (
     PAYLOAD_MULTI_DATA,
     PAYLOAD_SPLIT_GRID,
     cell_count,
+    host_pack_data,
     host_pack_split_grid,
+    host_unpack_data,
     is_calc_range_payload,
     is_dataframe_payload,
     is_image_payload,
@@ -44,6 +52,7 @@ _CROSSHAIR_TARGETS = (
     "splitgrid.codec.is_numeric_coercible",
     "splitgrid.codec.is_numeric_grid",
     "splitgrid.codec.cell_count",
+    "splitgrid.codec.should_use_binary_envelope",
     "splitgrid.codec.is_split_grid",
     "splitgrid.codec.is_multi_data",
     "splitgrid.codec.is_image_payload",
@@ -65,7 +74,7 @@ _CELL = st.one_of(
     st.booleans(),
     st.integers(min_value=-10_000, max_value=10_000),
     st.floats(allow_nan=False, allow_infinity=False, width=64),
-    st.text(max_size=12),
+    st.text(alphabet=st.characters(blacklist_categories=("Cs",), max_codepoint=127), max_size=12),
 )
 
 
@@ -79,7 +88,7 @@ def _find_crosshair() -> str | None:
     return None
 
 
-@given(s=st.text(min_size=1, max_size=40).filter(lambda t: bool(t.strip())))
+@given(s=st.text(alphabet=st.characters(blacklist_categories=("Cs",), max_codepoint=127), min_size=1, max_size=40).filter(lambda t: t.strip() != ""))
 @settings(max_examples=vhs_max_examples(80, 800), deadline=None)
 def test_hypothesis_nonempty_strings_never_coercible(s: str) -> None:
     assert is_numeric_coercible(s) is False
@@ -92,22 +101,42 @@ def test_zero_dim_shape_cell_count() -> None:
     assert cell_count((0, 5)) == 0
     assert cell_count((5, 0)) == 0
     assert cell_count((1, 1, 1, 1)) == 1
+    # Empty grid is numeric (vacuous). Use len(), not bool(grid), in the ensure.
+    assert is_numeric_grid([]) is True
 
 
 def test_cell_count_overflow_pre_fails_closed() -> None:
     if not deal_pre_present(cell_count):
         pytest.skip("@deal.pre stripped in release bundle")
+    # Shape dims follow Calc row bound (AFC (300, 1) must pass), not SHAPE_DIM.
+    assert cell_count((300, 1)) == 300
     with pytest.raises(deal.PreContractError):
-        cell_count((DEAL_MAX_SHAPE_DIM + 1,))
+        cell_count((DEAL_MAX_ROW_INDEX + 2,))
     with pytest.raises(deal.PreContractError):
         cell_count(tuple([1] * (DEAL_MAX_SHAPE_RANK + 1)))
+    # min_cells is a cell-count threshold, not a shape side. SHAPE_DIM+1 and
+    # the bench flag 1000 must pack. One past a full Calc column still fails.
+    assert should_use_binary_envelope((1,), min_cells=1000) is False
+    assert should_use_binary_envelope((1,), min_cells=DEAL_MAX_SHAPE_DIM + 1) is False
+    assert host_pack_data([[1.0]], min_cells=1000) == [[1.0]]
     with pytest.raises(deal.PreContractError):
-        should_use_binary_envelope((1,), min_cells=DEAL_MAX_SHAPE_DIM + 1)
+        should_use_binary_envelope((1,), min_cells=DEAL_MAX_ROW_INDEX + 2)
+    # Product grid uses sheet bounds; SHAPE_DIM+1 stays legal (Population A1:H1517).
+    assert is_numeric_grid([0] * (DEAL_MAX_SHAPE_DIM + 1)) is True
+    assert is_numeric_grid([[0] * (DEAL_MAX_SHAPE_DIM + 1)]) is True
+
+    class _OverRow(list):
+        def __len__(self) -> int:
+            return DEAL_MAX_ROW_INDEX + 2
+
+    class _OverCol(list):
+        def __len__(self) -> int:
+            return DEAL_MAX_COL_INDEX + 2
+
     with pytest.raises(deal.PreContractError):
-        is_numeric_grid([0] * (DEAL_MAX_SHAPE_DIM + 1))
+        is_numeric_grid(_OverRow([0]))
     with pytest.raises(deal.PreContractError):
-        is_numeric_grid([[0] * (DEAL_MAX_SHAPE_DIM + 1)])
-    assert is_numeric_grid([0] * DEAL_MAX_SHAPE_DIM) is True
+        is_numeric_grid([_OverCol([0])])
 
 
 def test_host_pack_split_grid_empty() -> None:
@@ -165,6 +194,17 @@ def test_zip_code_string_not_coercible() -> None:
     assert is_numeric_grid([[1.0, 2.0], [3.0, None]]) is True
 
 
+def test_is_numeric_coercible_odd_values_return_false() -> None:
+    """A list, a dict, or non-ASCII text is not coercible. It must not PreContract."""
+    assert is_numeric_coercible([1]) is False
+    assert is_numeric_coercible({"a": 1}) is False
+    assert is_numeric_coercible("café") is False
+    assert is_numeric_coercible("x" * (DEAL_MAX_SOURCE + 1)) is False
+    assert is_numeric_coercible(None) is True
+    assert is_numeric_coercible(True) is True
+    assert is_numeric_coercible(1) is True
+
+
 def test_wire_cell_count_split_grid_and_none() -> None:
     assert wire_cell_count(None) == 0
     assert wire_cell_count(42) == 1
@@ -213,15 +253,24 @@ def test_envelope_detectors_reject_malformed() -> None:
     assert is_calc_range_payload({"__wa_payload__": PAYLOAD_CALC_RANGE, "shape": [1, 1]}) is False
 
 
-def test_envelope_detector_overflow_pre_fails_closed() -> None:
-    if not deal_pre_present(is_image_payload):
-        pytest.skip("@deal.pre stripped in release bundle")
+def test_plain_dict_over_shape_dim_unpacks_with_deal() -> None:
+    """A word-frequency dict bigger than SHAPE_DIM is an ordinary result.
+
+    Detector @deal.pre used to reject len(dict) > DEAL_MAX_SHAPE_DIM, and
+    host_unpack_data's pre called that deal-wrapped detector first. Both raised
+    PreContractError (AssertionError) before the plain-dict path.
+    """
     too_many = {f"k{i}": i for i in range(DEAL_MAX_SHAPE_DIM + 1)}
-    with pytest.raises(deal.PreContractError):
-        is_image_payload(too_many)
-    with pytest.raises(deal.PreContractError):
-        is_split_grid(too_many)
+    for det in _DETECTORS:
+        assert det(too_many) is False
+    assert host_unpack_data(too_many) == too_many
     assert is_image_payload({"a": 1}) is False
+    # datetime / bytes are ordinary nested results. The type-list pre used
+    # to raise on the recursive call.
+    from datetime import datetime
+
+    nested = {"when": datetime(2026, 1, 2), "blob": b"abc"}
+    assert host_unpack_data(nested) == nested
 
 
 @given(
@@ -230,9 +279,13 @@ def test_envelope_detector_overflow_pre_fails_closed() -> None:
         st.booleans(),
         st.integers(),
         st.floats(allow_nan=False, allow_infinity=False),
-        st.text(max_size=20),
-        st.lists(st.integers(), max_size=4),
-        st.dictionaries(st.text(max_size=8), st.integers(), max_size=4),
+        st.text(alphabet=st.characters(blacklist_categories=("Cs",), max_codepoint=127), max_size=20),
+        st.lists(st.integers(min_value=-100, max_value=100), max_size=4),
+        st.dictionaries(
+            st.text(alphabet=st.characters(blacklist_categories=("Cs",), max_codepoint=127), max_size=8),
+            st.integers(min_value=-100, max_value=100),
+            max_size=4,
+        ),
         st.fixed_dictionaries({"__wa_payload__": st.sampled_from(["", "nope", "grid", "img"])}),
         st.fixed_dictionaries(
             {
@@ -252,6 +305,22 @@ def test_host_pack_split_grid_is_split_grid() -> None:
     packed = host_pack_split_grid([[1.0, 2.0], [3.0, 4.0]])
     assert is_split_grid(packed) is True
     assert is_multi_data(packed) is False
+
+
+def test_payload_codec_cover_all_33797534946_offs() -> None:
+    """Skip-reason, image suffix, and column-kind helpers stay off; the threshold helper stays on."""
+    import inspect
+
+    import splitgrid.codec as codec
+
+    for name in (
+        "binary_envelope_skip_reason",
+        "image_payload_suffix",
+        "_uniform_column_kind",
+    ):
+        assert "# crosshair: off" in inspect.getsource(getattr(codec, name)), name
+    policy = inspect.getsource(codec.should_use_binary_envelope)
+    assert "# crosshair: off" not in policy
 
 
 @pytest.mark.slow

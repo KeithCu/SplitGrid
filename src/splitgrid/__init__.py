@@ -33,6 +33,7 @@ from splitgrid.codec import (
     describe_wire_value,
     envelope_column_kinds,
     envelope_uniform_column_kind,
+    find_image_payloads,
     get_cython_status_info,
     grid_from_nested_list,
     host_cython_status_line,
@@ -41,6 +42,7 @@ from splitgrid.codec import (
     host_pack_split_grid,
     host_unpack_data,
     host_unpack_split_grid,
+    image_payload_suffix,
     invalidate_host_cython_accelerator,
     is_dataframe_payload,
     is_calc_range_payload,
@@ -53,9 +55,11 @@ from splitgrid.codec import (
     reload_host_cython_accelerator,
     should_use_binary_envelope,
     wire_cell_count,
+    wire_str_key,
+    write_image_payload_to_temp,
 )
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 
 
 def __getattr__(name: str):
@@ -92,6 +96,7 @@ __all__ = [
     "envelope_column_kinds",
     "envelope_uniform_column_kind",
     "fast_flatten_grid_1d",
+    "find_image_payloads",
     "fast_flatten_grid_2d",
     "get_cython_status_info",
     "grid_from_nested_list",
@@ -101,6 +106,7 @@ __all__ = [
     "host_pack_split_grid",
     "host_unpack_data",
     "host_unpack_split_grid",
+    "image_payload_suffix",
     "invalidate_host_cython_accelerator",
     "is_calc_range_payload",
     "is_dataframe_payload",
@@ -113,4 +119,6 @@ __all__ = [
     "reload_host_cython_accelerator",
     "should_use_binary_envelope",
     "wire_cell_count",
+    "wire_str_key",
+    "write_image_payload_to_temp",
 ]

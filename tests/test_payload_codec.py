@@ -1,4 +1,4 @@
-# WriterAgent - AI Writing Assistant for LibreOffice
+# SplitGrid
 # Copyright (c) 2026 KeithCu (modifications and relicensing)
 #
 # This program is free software: you can redistribute it and/or modify
@@ -8,13 +8,16 @@
 """Tests for payload_codec (host stdlib / child NumPy wire format).
 
 Sections: policy threshold, host pack/unpack, child pack/unpack, round-trips, NaN/missing,
-realistic Calc-shaped grids only (rectangular 2D; uneven row lengths are rejected at pack).
+realistic Calc-shaped grids (rectangular 2D). Uneven row lengths raise on split_grid;
+the small list path returns them unchanged.
 """
 
 from __future__ import annotations
 
+import array
 import ast
 import math
+import sys
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -24,16 +27,19 @@ import pytest
 import splitgrid.codec as payload_codec
 from splitgrid.codec import (
     BINARY_MIN_CELLS,
+    PAYLOAD_CALC_RANGE,
     PAYLOAD_DATAFRAME,
     PAYLOAD_MULTI_DATA,
     PAYLOAD_SPLIT_GRID,
     binary_envelope_skip_reason,
     child_pack_result,
     child_unpack_data,
+    child_unpack_split_grid,
     describe_wire_value,
     host_pack_data,
     host_pack_multi_data,
     host_unpack_data,
+    host_unpack_split_grid,
     is_dataframe_payload,
     is_multi_data,
     is_numeric_coercible,
@@ -42,7 +48,6 @@ from splitgrid.codec import (
     should_use_binary_envelope,
     wire_cell_count,
 )
-from tests.serialization_ab_support import cython_accelerator_context
 from tests.payload_codec_test_support import (
     MIXED_LABEL_GRID,
     MIXED_WITH_ZIP,
@@ -52,6 +57,8 @@ from tests.payload_codec_test_support import (
     pickle5_roundtrip,
     rect_shape_for_cell_count,
 )
+from tests.serialization_ab_support import cython_accelerator_context
+
 
 def test_host_module_does_not_import_numpy_at_module_level():
     """Host path must stay NumPy-free at import time (ABI / LO embedded Python)."""
@@ -63,6 +70,13 @@ def test_host_module_does_not_import_numpy_at_module_level():
                 assert not alias.name.startswith("numpy"), alias.name
         elif isinstance(node, ast.ImportFrom) and node.module:
             assert not node.module.startswith("numpy"), node.module
+
+
+def test_flatten_grid_return_parameterizes_array() -> None:
+    """Bare array.array leftovers trip reportMissingTypeArgument."""
+    from splitgrid.codec import _flatten_grid_to_components
+
+    assert _flatten_grid_to_components.__annotations__["return"] == "tuple[array.array[float], dict[int, str], list[str], list[int]]"
 
 
 @pytest.mark.parametrize(
@@ -144,7 +158,8 @@ def test_column_kinds_from_cell_types():
     assert column_kinds_for_grid([[100, 1.5], [101, 2.5]]) == ["int", "float"]
     assert column_kinds_for_grid([[1.5, 2.0]]) == ["float", "float"]
     assert column_kinds_for_grid([[1, None]]) == ["int", "float"]
-    assert column_kinds_for_grid([[1, "x"]]) == ["int", "int"]
+    assert column_kinds_for_grid([[1, "x"]]) == ["int", "float"]
+    assert column_kinds_for_grid([["x"], ["y"]]) == ["float"]
 
 
 def test_uniform_unpack_uses_full_column_kinds_on_wire():
@@ -191,12 +206,137 @@ def test_child_pack_integer_ndarray_sets_column_kinds():
     assert isinstance(back[0][0], int)
 
 
+def test_child_pack_bool_ndarray_sets_column_kinds():
+    np = pytest.importorskip("numpy")
+    from splitgrid.codec import child_pack_split_grid
+
+    wire = child_pack_split_grid(np.array([[True, False], [False, True]]))
+    assert wire["column_kinds"] == ["bool", "bool"]
+    back = host_unpack_data(wire, as_nested_list=True)
+    assert back == [[True, False], [False, True]]
+
+
+def test_split_grid_bool_beside_float_stays_float_in_child():
+    """A bool column next to floats stays float64 in the child.
+
+    Host unpack restores True. =PY() sees 1.0. == treats True == 1.0, so
+    this checks type identity.
+    """
+    np = pytest.importorskip("numpy")
+    grid = [[1.5, True], [2.5, False]]
+    wire = host_pack_data(grid, force="always")
+    assert wire["column_kinds"] == ["float", "bool"]
+    child = child_unpack_data(wire)
+    assert isinstance(child, np.ndarray)
+    assert child.dtype == np.float64
+    assert type(child[0, 1].item()) is float
+    assert child[0, 1].item() == 1.0
+    assert type(child[1, 1].item()) is float
+    assert child[1, 1].item() == 0.0
+    host = host_unpack_data(wire)
+    assert host[0][1] is True
+    assert host[1][1] is False
+    assert type(host[0][0]) is float
+
+
+def test_decode_split_grid_buffer_rejects_non_bytes() -> None:
+    """bytearray and memoryview are TypeError, including when deal is stripped.
+
+    Pack and b64decode hand this helper bytes. Do not coerce a legacy buffer.
+    """
+    payload = array.array("d", [1.0]).tobytes()
+    base = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "dtype": "float64",
+        "shape": [1],
+        "strings": {},
+    }
+    for raw in (bytearray(payload), memoryview(payload)):
+        envelope = {**base, "buffer": raw}
+        with pytest.raises(TypeError, match="bytes-like"):
+            payload_codec._decode_split_grid_buffer(envelope, 1)
+    assert payload_codec._decode_split_grid_buffer({**base, "buffer": payload}, 1) == payload
+
+
+def test_split_grid_mixed_bool_int_column_becomes_int():
+    """One column cannot be both bool and int. split_grid promotes to int.
+
+    force=never keeps True. The A/B oracle uses ==, and True == 1, so this
+    checks type and identity.
+    """
+    np = pytest.importorskip("numpy")
+    grid = [[True], [1]]
+    wire = host_pack_data(grid, force="always")
+    assert wire["column_kinds"] == ["int"]
+    unpacked = host_unpack_split_grid(wire)
+    assert unpacked == [[1], [1]]
+    assert type(unpacked[0][0]) is int
+    assert type(unpacked[1][0]) is int
+
+    listed = host_pack_data(grid, force="never")
+    assert listed[0][0] is True
+    assert type(listed[1][0]) is int
+
+    child = child_unpack_split_grid(wire)
+    assert child.dtype == np.int64
+    assert type(child[0, 0].item()) is int
+
+
+def test_child_unpack_float_frombuffer_is_readonly():
+    """Uniform float and mixed numeric kinds are the read-only frombuffer view.
+
+    Uniform int and bool allocate via astype and ==, so those arrays are
+    writable. CalcRange.to_numpy() is the writable copy for =PY().
+    """
+    np = pytest.importorskip("numpy")
+    float_arr = child_unpack_split_grid(host_pack_data([[1.5, 2.5]], force="always"))
+    assert float_arr.dtype == np.float64
+    assert float_arr.flags.writeable is False
+    with pytest.raises(ValueError, match="read-only"):
+        float_arr[0, 0] = 9.0
+
+    mixed = child_unpack_split_grid(host_pack_data([[1, 1.5]], force="always"))
+    assert mixed.dtype == np.float64
+    assert mixed.flags.writeable is False
+
+    int_arr = child_unpack_split_grid(host_pack_data([[1, 2]], force="always"))
+    assert int_arr.flags.writeable is True
+    bool_arr = child_unpack_split_grid(host_pack_data([[True, False]], force="always"))
+    assert bool_arr.dtype == np.bool_
+    assert bool_arr.flags.writeable is True
+
+
 def test_none_becomes_nan_in_split_grid():
     pytest.importorskip("numpy")
     wire = host_pack_data([[1.0, None, 3.0]], force="always")
     arr = child_unpack_data(wire)
     assert arr.shape == (1, 3)
     assert math.isnan(float(arr[0, 1]))
+
+
+def test_child_pack_plain_python_without_numpy() -> None:
+    """Plain Python results serialize when NumPy is unavailable.
+
+    ``sys.modules['numpy'] = None`` is how a later ``import numpy`` fails
+    (``ModuleNotFoundError``), without intercepting every other import.
+    """
+    result = {"changes": [["pays", "paid"]]}
+    with patch.dict(sys.modules, {"numpy": None}):
+        assert child_pack_result(result, force="auto") == result
+
+
+def test_child_unpack_plain_python_without_numpy() -> None:
+    """Inbound lists and dicts materialize when NumPy is unavailable.
+
+    A numeric list stays a list: there is no ndarray to build. ``split_grid``
+    still needs NumPy and is not covered here.
+    """
+    text = [["pays", "paid"]]
+    numbers = [1.0, 2.0]
+    with patch.dict(sys.modules, {"numpy": None}):
+        assert child_unpack_data(text) == text
+        assert child_unpack_data({"changes": text}) == {"changes": text}
+        assert child_unpack_data(numbers) == numbers
 
 
 def test_scalar_egress_stays_json():
@@ -347,14 +487,14 @@ def test_round_trip_split_grid_1d():
 
 
 def test_child_unpack_single_entry_auto_scalar_and_integer_coercion():
-    """Verify that child_unpack_data automatically unpacks single-entry inputs into scalars and coerces float-integers."""
+    """Single-cell floats stay floats. A longer float64 column already did; 1×1 used to become int."""
     np = pytest.importorskip("numpy")
 
-    # 1. 1-element numeric list representing an integer float
+    # 1. 1-element numeric list representing a whole-number float
     wire_int_float = [100000.0]
     unpacked_int_float = child_unpack_data(wire_int_float)
-    assert isinstance(unpacked_int_float, int)
-    assert unpacked_int_float == 100000
+    assert isinstance(unpacked_int_float, float)
+    assert unpacked_int_float == 100000.0
 
     # 2. 1-element numeric list representing a real float
     wire_real_float = [3.14]
@@ -374,11 +514,11 @@ def test_child_unpack_single_entry_auto_scalar_and_integer_coercion():
     assert isinstance(unpacked_bool, bool)
     assert unpacked_bool is True
 
-    # 5. 1-element numpy array representing an integer float (e.g. from split-grid of shape (1,))
+    # 5. 1-element numpy array representing a whole-number float
     arr_int_float = np.array([100000.0])
     unpacked_arr_int_float = child_unpack_data(arr_int_float)
-    assert isinstance(unpacked_arr_int_float, int)
-    assert unpacked_arr_int_float == 100000
+    assert isinstance(unpacked_arr_int_float, float)
+    assert unpacked_arr_int_float == 100000.0
 
     # 6. Multi-element list or 2D list should NOT be unpacked to scalar
     assert isinstance(child_unpack_data([100000.0, 200000.0]), np.ndarray)
@@ -407,10 +547,138 @@ def test_iter_split_grid_cells_row_major_order() -> None:
     ]
 
 
-def test_uneven_row_lengths_rejected_on_host_pack() -> None:
-    """Uneven nested-list rows are unsupported; Calc ranges are always rectangular."""
+def test_uneven_row_lengths_rejected_on_split_grid_only() -> None:
+    """Split_grid rejects a jagged grid. The small list path returns it unchanged.
+
+    =PY pre-normalizes with ensure_rectangular_2d. child_pack treats a
+    non-rectangular result as a list of rows, not one grid.
+    """
+    jagged = [[1, 2], [3]]
+    assert host_pack_data(jagged, force="never") == jagged
+    assert host_pack_data(jagged) == jagged
     with pytest.raises(ValueError, match="Uneven row lengths"):
-        host_pack_data([[1, 2], [3]], force="always")
+        host_pack_data(jagged, force="always")
+
+
+def test_rectangular_tuple_rows_egress_as_lists() -> None:
+    """A rectangular tuple-of-tuples becomes a list-of-lists on the list path.
+
+    host_unpack_data would restore tuples that are still tuples on the wire.
+    This egress path does not send them. Split_grid cannot keep row types.
+    """
+    packed = child_pack_result(((1, 2), (3, 4)), force="never")
+    assert packed == [[1, 2], [3, 4]]
+    assert type(packed) is list
+    assert all(type(row) is list for row in packed)
+    assert host_unpack_data(packed) == packed
+    restored = host_unpack_data(((1, 2), (3, 4)))
+    assert type(restored) is tuple
+    assert type(restored[0]) is tuple
+
+
+def test_non_sequence_row_raises_valueerror() -> None:
+    """A scalar or string row is ValueError, not TypeError from len().
+
+    Deal's pre rejects the grid before the body. The release build strips
+    deal, and that path used to raise TypeError.
+    """
+    from tests.strip_bundle import expect_pre_or_body
+
+    with pytest.raises(ValueError, match="not a list or tuple"):
+        payload_codec._split_grid_row_width(3)
+    with pytest.raises(ValueError, match="not a list or tuple"):
+        payload_codec._validate_rectangular_grid([[1, 2], 3])
+    with pytest.raises(ValueError, match="not a list or tuple"):
+        payload_codec._validate_rectangular_grid([[1, 2], "ab"])
+    for grid in ([[1, 2], 3], [[1, 2], "ab"]):
+        expect_pre_or_body(lambda grid=grid: host_pack_data(grid), body_exc=ValueError)
+        expect_pre_or_body(
+            lambda grid=grid: host_pack_data(grid, force="always"), body_exc=ValueError
+        )
+
+
+def test_child_unpack_non_sequence_row_raises_valueerror() -> None:
+    """[[1, 2], 3] is ValueError, not TypeError from list(row) or len(row).
+
+    _child_unpack_single_data and wire_cell_count have no grid pre, so deal
+    did not hide the TypeError. is_numeric_grid's pre rejects the grid; the
+    stripped body must still raise ValueError.
+    """
+    from tests.strip_bundle import expect_pre_or_body
+
+    for grid in ([[1, 2], 3], [[1, 2], "ab"]):
+        with pytest.raises(ValueError, match="not a list or tuple") as caught:
+            child_unpack_data(grid)
+        assert type(caught.value) is ValueError
+        with pytest.raises(ValueError, match="not a list or tuple") as counted:
+            wire_cell_count(grid)
+        assert type(counted.value) is ValueError
+        expect_pre_or_body(lambda grid=grid: is_numeric_grid(grid), body_exc=ValueError)
+
+
+def test_split_grid_bad_b64_raises_valueerror() -> None:
+    """A bad legacy b64 is ValueError, not binascii.Error or UnicodeEncodeError.
+
+    What was wrong: both subclass ValueError, and deal.raises matches exact
+    types, so the failure became RaisesContractError (AssertionError).
+    """
+    import base64
+
+    raw = array.array("d", [1.5]).tobytes()
+    good = base64.b64encode(raw).decode("ascii")
+    envelope = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [1],
+        "dtype": "float64",
+        "column_kinds": ["float"],
+        "strings": {},
+    }
+    good_env = {**envelope, "b64": good}
+    assert host_unpack_split_grid(good_env) == [1.5]
+    pytest.importorskip("numpy")
+    child = child_unpack_split_grid(good_env)
+    assert float(child[0]) == pytest.approx(1.5)
+
+    junk = good[:4] + "!" + good[4:]
+    for bad in ("!!!!", "abc", junk, "café"):
+        bad_env = {**envelope, "b64": bad}
+        for unpack in (host_unpack_split_grid, child_unpack_split_grid):
+            with pytest.raises(ValueError, match="not valid base64") as caught:
+                unpack(bad_env)
+            assert type(caught.value) is ValueError
+
+
+def test_column_kinds_for_grid_jagged_raises() -> None:
+    """The kinds helper used to return [] and hide the flatten ValueError."""
+    with pytest.raises(ValueError, match="Uneven row lengths"):
+        payload_codec.column_kinds_for_grid([[1, 2], [3]])
+
+
+def test_envelope_detectors_reject_bool_shape_dims() -> None:
+    """bool is an int subclass. True used to pass as a shape extent."""
+    from splitgrid.codec import is_calc_range_payload
+
+    assert is_split_grid(
+        {
+            "__wa_payload__": PAYLOAD_SPLIT_GRID,
+            "shape": [True, 1],
+            "buffer": b"\x00" * 8,
+        }
+    ) is False
+    assert is_calc_range_payload(
+        {
+            "__wa_payload__": PAYLOAD_CALC_RANGE,
+            "shape": [1, False],
+            "data": [[1.0]],
+        }
+    ) is False
+    assert is_split_grid(
+        {
+            "__wa_payload__": PAYLOAD_SPLIT_GRID,
+            "shape": [0, 0],
+            "buffer": b"",
+        }
+    ) is True
 
 
 # --- NaN, empty cells, and inf (realistic Calc / NumPy paths) ---
@@ -551,6 +819,155 @@ def test_decimal_split_grid_stays_float_not_truncated_int() -> None:
     assert out[0][1] == pytest.approx(2.25)
 
 
+def test_decimal_fraction_encoding_ignores_earlier_text() -> None:
+    """Decimal and Fraction stay floats after a text cell, same as before one."""
+    from fractions import Fraction
+
+    from splitgrid.codec import host_pack_split_grid
+
+    def _check() -> None:
+        after_text = host_unpack_split_grid(
+            host_pack_split_grid([["02138", Decimal("1.25"), Fraction(1, 4)]])
+        )
+        assert after_text[0][0] == "02138"
+        assert after_text[0][1] == pytest.approx(1.25)
+        assert after_text[0][2] == pytest.approx(0.25)
+        assert type(after_text[0][1]) is float
+        assert type(after_text[0][2]) is float
+
+        before_text = host_unpack_split_grid(
+            host_pack_split_grid([[Decimal("1.25"), Fraction(1, 4), "02138"]])
+        )
+        assert before_text[0][0] == pytest.approx(1.25)
+        assert before_text[0][1] == pytest.approx(0.25)
+        assert before_text[0][2] == "02138"
+        assert type(before_text[0][0]) is type(after_text[0][1])
+        assert type(before_text[0][1]) is type(after_text[0][2])
+
+        wire = host_pack_split_grid(
+            [["label", "x"], [Decimal("1.50"), Fraction(1, 4)]]
+        )
+        assert "1.50" not in wire["strings"].values()
+        assert "1/4" not in wire["strings"].values()
+        same_col = host_unpack_split_grid(wire)
+        assert same_col[0] == ["label", "x"]
+        assert same_col[1][0] == pytest.approx(1.5)
+        assert same_col[1][1] == pytest.approx(0.25)
+        assert wire["column_kinds"] == ["float", "float"]
+
+    with cython_accelerator_context(enabled=False):
+        _check()
+    if payload_codec.fast_flatten_grid_2d is not None:
+        _check()
+
+
+class _ObjectKind:
+    kind = "O"
+
+
+class _WeirdFloat:
+    """dtype.kind 'O' whose float() succeeds. str() is 'W' so a stringify shows up."""
+
+    dtype = _ObjectKind()
+
+    def __float__(self) -> float:
+        return 1.5
+
+    def __str__(self) -> str:
+        return "W"
+
+
+def test_unknown_dtype_kind_promotes_column_like_cython() -> None:
+    """kind 'O' that float() accepts is a float column on both packers.
+
+    The pure path used to leave the column bool while Cython set float.
+    """
+    from splitgrid.codec import column_kinds_for_grid
+
+    grid = [[True, 0], [_WeirdFloat(), 0]]
+    with cython_accelerator_context(enabled=False):
+        assert column_kinds_for_grid(grid) == ["float", "int"]
+    if payload_codec.fast_flatten_grid_2d is not None:
+        assert column_kinds_for_grid(grid) == ["float", "int"]
+
+
+def test_unknown_dtype_kind_numeric_regardless_of_string_position() -> None:
+    """The same object is a float before or after a text cell.
+
+    The slow path used to str() an unknown dtype kind, so ['x', Weird()]
+    became the text 'W' while [Weird(), 'x'] stayed 1.5.
+    """
+    from splitgrid.codec import host_pack_split_grid
+
+    weird = _WeirdFloat()
+
+    def _check() -> None:
+        before = host_unpack_split_grid(host_pack_split_grid([[weird, "x"]]))
+        assert before[0][0] == pytest.approx(1.5)
+        assert type(before[0][0]) is float
+        assert before[0][1] == "x"
+        after_wire = host_pack_split_grid([["x", weird]])
+        assert "W" not in after_wire["strings"].values()
+        after = host_unpack_split_grid(after_wire)
+        assert after[0][0] == "x"
+        assert after[0][1] == pytest.approx(1.5)
+        assert type(after[0][1]) is float
+
+    with cython_accelerator_context(enabled=False):
+        _check()
+    if payload_codec.fast_flatten_grid_2d is not None:
+        _check()
+
+
+def test_numpy_str_stays_text_on_split_grid() -> None:
+    """Unicode scalars stay text. float() must not eat a zip-code-like np.str_."""
+    np = pytest.importorskip("numpy")
+    from splitgrid.codec import host_pack_split_grid
+
+    def _check() -> None:
+        wire = host_pack_split_grid([[np.str_("02138")]])
+        assert "02138" in wire["strings"].values()
+        assert host_unpack_split_grid(wire) == [["02138"]]
+
+    with cython_accelerator_context(enabled=False):
+        _check()
+    if payload_codec.fast_flatten_grid_2d is not None:
+        _check()
+
+
+def test_wide_sheet_above_shape_dim_unpacks() -> None:
+    """Pack accepts real sheet widths; unpack must not cap columns at SHAPE_DIM."""
+    import deal
+
+    from splitgrid.deal_shim import DEAL_MAX_COL_INDEX, DEAL_MAX_SHAPE_DIM
+    from splitgrid.codec import envelope_column_kinds
+    from tests.strip_bundle import deal_pre_present
+
+    ncols = DEAL_MAX_SHAPE_DIM + 1
+    grid = [[float(i) for i in range(ncols)]]
+    wire = host_pack_data(grid, force="auto")
+    assert is_split_grid(wire)
+    assert wire["shape"] == [1, ncols]
+    unpacked = host_unpack_data(wire)
+    assert len(unpacked) == 1
+    assert len(unpacked[0]) == ncols
+    assert unpacked[0][0] == pytest.approx(0.0)
+    assert unpacked[0][-1] == pytest.approx(float(ncols - 1))
+
+    np = pytest.importorskip("numpy")
+    arr = child_unpack_data(wire)
+    assert isinstance(arr, np.ndarray)
+    assert arr.shape == (1, ncols)
+    assert float(arr[0, -1]) == pytest.approx(float(ncols - 1))
+
+    cap = DEAL_MAX_COL_INDEX + 1
+    kinds = envelope_column_kinds({"column_kinds": ["float"] * cap}, ncols=cap)
+    assert kinds == ["float"] * cap
+    if deal_pre_present(envelope_column_kinds):
+        with pytest.raises(deal.PreContractError):
+            envelope_column_kinds({}, ncols=cap + 1)
+
+
 def test_bool_cells_round_trip_in_numeric_grid() -> None:
     """Calc booleans in an all-numeric grid become 0.0/1.0 in child ndarray (float64 lane)."""
     np = pytest.importorskip("numpy")
@@ -575,24 +992,140 @@ def test_split_grid_boundary_at_binary_min_cells() -> None:
 
 
 
-
 def test_child_pack_below_threshold_returns_list() -> None:
-    """Small ndarray egress below threshold returns the ndarray (not forced tolist or split_grid).
+    """Small ndarray egress below threshold is a nested list, not an ndarray or split_grid.
 
-    Per small_ndarray_result choice, we leave ndarray objects for sub-threshold pure numeric results
-    rather than converting to list. Host unpack and downstream (e.g. to_calc_compatible) accept ndarray.
+    Bugfix: returning the ndarray made a DataFrame under 100 cells spill only its
+    header, and a bare multi-cell array become one Calc string.
     """
     np = pytest.importorskip("numpy")
     n = max(1, BINARY_MIN_CELLS - 1)
     rows, cols = rect_shape_for_cell_count(n)
     small = np.arange(n, dtype=np.float64).reshape(rows, cols)
     wire = child_pack_result(small, force="auto")
-    # Not a split_grid (too small), and not auto-converted to list; ndarray is left as-is.
     assert not is_split_grid(wire)
-    assert isinstance(wire, np.ndarray)
-    assert wire.shape[0] == rows
-    # Also tolerate if some future change decides to list-ify small; the key is "no split envelope".
+    assert isinstance(wire, list)
+    assert len(wire) == rows
+    assert wire[0][0] == pytest.approx(0.0)
 
+
+def test_split_grid_unpack_rejects_non_dict_strings() -> None:
+    """strings must be a dict before .items(); a list used to raise AttributeError."""
+    pytest.importorskip("numpy")
+    envelope = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [1],
+        "buffer": array.array("d", [1.0]).tobytes(),
+        "strings": ["not", "a", "dict"],
+    }
+    with pytest.raises(ValueError, match="strings must be a dict"):
+        host_unpack_split_grid(envelope)
+    with pytest.raises(ValueError, match="strings must be a dict"):
+        child_unpack_split_grid(envelope)
+
+
+@pytest.mark.parametrize("key", [float("inf"), 1.5, True])
+def test_split_grid_rejects_non_integer_string_keys(key: object) -> None:
+    """Float, inf, and bool keys must not truncate into another cell.
+
+    What was wrong: ``int(1.5)`` stored the string at index 1, and
+    ``int(float("inf"))`` raised OverflowError. The child contract only
+    declares ValueError, so under deal that became RaisesContractError.
+    """
+    envelope = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [2],
+        "buffer": array.array("d", [7.0, 8.0]).tobytes(),
+        "strings": {key: "x"},
+    }
+    with pytest.raises(ValueError, match="not an integer"):
+        host_unpack_split_grid(envelope)
+    pytest.importorskip("numpy")
+    with pytest.raises(ValueError, match="not an integer"):
+        child_unpack_split_grid(envelope)
+
+
+def test_split_grid_digit_string_key_still_maps() -> None:
+    """Legacy harnesses sent stringified indexes. ``-1`` is an int, then out of bounds."""
+    ok = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [2],
+        "buffer": array.array("d", [7.0, 8.0]).tobytes(),
+        "strings": {"0": "zip"},
+    }
+    assert host_unpack_split_grid(ok) == ["zip", 8.0]
+    neg = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [2],
+        "buffer": array.array("d", [7.0, 8.0]).tobytes(),
+        "strings": {"-1": "x"},
+    }
+    with pytest.raises(ValueError, match="out of bounds"):
+        host_unpack_split_grid(neg)
+    pytest.importorskip("numpy")
+    assert child_unpack_split_grid(ok) == ["zip", 8.0]
+
+
+def test_integers_past_float64_mantissa_round_only_on_split_grid() -> None:
+    """``2**53 + 1`` survives a nested list and rounds once the float64 buffer is used.
+
+    Locked in docs/calc/py-data-shapes.md (no int64 wire lane). A list-packing
+    fallback would change the wire for every oversized integer.
+    """
+    big = 2**53 + 1
+    small = [[big, 1], [2, 3]]
+    assert host_unpack_data(host_pack_data(small, force="never")) == small
+    assert host_unpack_data(host_pack_data(small, force="always"))[0][0] == 2**53
+
+    grid = [[0] * 10 for unused in range(10)]
+    grid[0][0] = big
+    packed = host_pack_data(grid)
+    assert is_split_grid(packed)
+    assert host_unpack_data(packed)[0][0] == 2**53
+
+    np = pytest.importorskip("numpy")
+    arr = np.array([[big, 1], [2, 3]], dtype=np.int64)
+    assert host_unpack_data(child_pack_result(arr, force="always"))[0][0] == 2**53
+    child = child_unpack_data(host_pack_data(grid, force="always"))
+    assert int(child[0, 0]) == 2**53
+
+
+def test_host_unpack_split_grid_rejects_short_buffer() -> None:
+    """Declared shape must match the float buffer. A short buffer is not a short grid."""
+    buf = array.array("d", [1.0])
+    envelope = {
+        "__wa_payload__": "split_grid",
+        "shape": [2, 2],
+        "buffer": buf.tobytes(),
+        "strings": {},
+    }
+    with pytest.raises(ValueError, match="buffer has 1 values"):
+        host_unpack_split_grid(envelope)
+
+
+def test_child_unpack_split_grid_mixed_rejects_size_mismatch() -> None:
+    """Mixed-string child unpack must reject a buffer that does not match shape.
+
+    The numeric path already did. 1D mixed grids skip reshape, so a short
+    buffer used to come back as a shorter list and a long one kept extra cells.
+    """
+    pytest.importorskip("numpy")
+    short = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [4],
+        "buffer": array.array("d", [1.0, 2.0]).tobytes(),
+        "strings": {1: "x"},
+    }
+    with pytest.raises(ValueError, match="buffer has 2 values"):
+        child_unpack_split_grid(short)
+    long = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [2, 2],
+        "buffer": array.array("d", [1.0, 2.0, 3.0, 4.0, 5.0]).tobytes(),
+        "strings": {0: "a"},
+    }
+    with pytest.raises(ValueError, match="buffer has 5 values"):
+        child_unpack_split_grid(long)
 
 
 def test_child_pack_numpy_scalar_types() -> None:
@@ -648,6 +1181,11 @@ def test_is_numeric_coercible_and_is_numeric_grid() -> None:
     assert is_numeric_coercible("hello") is False
     assert is_numeric_grid([[1, 2], [3, 4]]) is True
     assert is_numeric_grid([1, "x"]) is False
+    # A user type whose name starts with "int" is not a NumPy scalar.
+    internal = type("internal", (), {})
+    assert is_numeric_coercible(internal()) is False
+    np = pytest.importorskip("numpy")
+    assert is_numeric_coercible(np.int64(3)) is True
 
 
 def test_pickle5_roundtrip_numeric_4x4() -> None:
@@ -696,7 +1234,7 @@ def test_split_grid_numpy_scalars_in_lists():
 
 
 def test_split_grid_boolean_roundtrip_fidelity():
-    """Verify that boolean columns roundtrip perfectly to True/False in mixed grids under the 'bool' ColumnKind."""
+    """Verify that boolean columns roundtrip perfectly to True/False in mixed grids under the 'bool' column kind."""
     pytest.importorskip("numpy")
     
     # 2D mixed grid containing booleans, strings, and None
@@ -709,11 +1247,13 @@ def test_split_grid_boolean_roundtrip_fidelity():
     
     # 1. Test column kinds computed correctly
     kinds = payload_codec.column_kinds_for_grid(grid)
-    assert kinds == ["bool", "int", "int"]  # column 0 is bool, column 2 has None and ints so remains int
+    # Text-only column is float, not int. The int column keeps int even with a None
+    # because the grid has strings, so the pure-numeric None promotion does not fire.
+    assert kinds == ["bool", "float", "int"]
     
     # 2. Test round-trip unpacking in child
     wire = host_pack_data(grid, force="always")
-    assert wire["column_kinds"] == ["bool", "int", "int"]
+    assert wire["column_kinds"] == ["bool", "float", "int"]
     child_unpacked = child_unpack_data(wire)
     assert isinstance(child_unpacked, list)
     assert child_unpacked[0] == [True, "apple", 10]
@@ -769,30 +1309,26 @@ def test_split_grid_pure_numeric_fast_path():
 
 
 
-
 def test_split_grid_single_cell_scalar_coercion():
-    """Verify automatic scalar extraction and whole float to integer coercion for single cells."""
+    """Single-cell whole-number floats stay floats, matching a longer float64 column."""
     np = pytest.importorskip("numpy")
-    
-    # 1. 1-element list with a whole number float should become python int
-    assert child_unpack_data([100.0]) == 100
-    assert isinstance(child_unpack_data([100.0]), int)
-    
-    # 2. 1-element list with real float remains float
+
+    assert child_unpack_data([100.0]) == 100.0
+    assert isinstance(child_unpack_data([100.0]), float)
+
     assert child_unpack_data([3.14]) == pytest.approx(3.14)
     assert isinstance(child_unpack_data([3.14]), float)
-    
-    # 3. 1-element ndarray with integer float
+
     arr = np.array([42.0])
-    assert child_unpack_data(arr) == 42
-    assert isinstance(child_unpack_data(arr), int)
+    assert child_unpack_data(arr) == 42.0
+    assert isinstance(child_unpack_data(arr), float)
 
 
 def test_split_grid_lattice_promotion_comprehensive():
     """Verify structural type promotions and kinds behavior for all scenarios."""
     # 1. Boolean-only column keeps bool kind in mixed grid
     grid1 = [[True, "apple"], [False, "banana"], [None, "cherry"]]
-    assert payload_codec.column_kinds_for_grid(grid1) == ["bool", "int"]
+    assert payload_codec.column_kinds_for_grid(grid1) == ["bool", "float"]
     
     # 2. Boolean mixed with integers becomes int
     grid2 = [[True], [10], [False]]
@@ -875,7 +1411,6 @@ def test_child_pack_grid_regression() -> None:
 
 
 
-
 def test_child_pack_non_contiguous_slices():
     """Verify that non-contiguous numpy slices pack successfully without zero-copy buffer issues."""
     np = pytest.importorskip("numpy")
@@ -890,16 +1425,32 @@ def test_child_pack_non_contiguous_slices():
 
 
 def test_pure_python_pack_speed_regression():
-    """Performance sanity check: 10k float cells should pack in under 15 milliseconds."""
+    """Sanity check: 10k float cells pack well under a CI-noisy budget.
+
+    A single 15ms sample flakes on macOS GHA under pytest-xdist (20.8ms vs 15ms
+    on run 35477002275) without a real pack regression. Warm up, then require
+    the fastest of a few packs to stay under 25ms — still a 10k-cell sanity
+    check, not a no-op.
+    """
     import time
     grid = [[float(i + j) for i in range(100)] for j in range(100)]
-    
-    start = time.perf_counter()
-    wire = host_pack_data(grid, force="always")
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    
-    assert is_split_grid(wire)
-    assert elapsed_ms < 15.0, f"Serialization took too long: {elapsed_ms:.2f}ms"
+
+    # First pack pays import / allocator / cache warmup; do not time it.
+    warm = host_pack_data(grid, force="always")
+    assert is_split_grid(warm)
+
+    samples_ms: list[float] = []
+    last_wire = warm
+    for unused in range(5):
+        start = time.perf_counter()
+        last_wire = host_pack_data(grid, force="always")
+        samples_ms.append((time.perf_counter() - start) * 1000)
+
+    assert is_split_grid(last_wire)
+    best_ms = min(samples_ms)
+    assert best_ms < 25.0, (
+        f"Serialization took too long: best={best_ms:.2f}ms samples={samples_ms!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -934,6 +1485,52 @@ def test_dataframe_envelope_roundtrips_through_host_unpack():
     assert data[0] == [10, "x"] or data[0][0] == 10
 
 
+def test_wire_cell_count_ndarray_dataframe_uses_size():
+    """An ndarray body is rows*cols, not the non-list fallback of 1."""
+    np = pytest.importorskip("numpy")
+    arr = np.zeros((2, 3))
+    env = {"__wa_payload__": PAYLOAD_DATAFRAME, "columns": ["a", "b", "c"], "data": arr}
+    assert wire_cell_count(env) == 6
+    assert "cells~1" not in describe_wire_value(env)
+    assert "cells~6" in describe_wire_value(env)
+
+
+def test_host_unpack_dataframe_keeps_extra_keys():
+    """Unknown envelope fields survive. Rebuilding only the three known keys dropped them."""
+    env = {
+        "__wa_payload__": PAYLOAD_DATAFRAME,
+        "columns": ["a"],
+        "data": [[1], [2]],
+        "index": ["r0", "r1"],
+    }
+    unpacked = host_unpack_data(env)
+    assert unpacked["index"] == ["r0", "r1"]
+    assert unpacked["columns"] == ["a"]
+    assert unpacked["data"] == [[1], [2]]
+
+
+def test_host_unpack_calc_range_keeps_extra_keys():
+    """Unknown calc_range fields survive, same as the dataframe shallow copy.
+
+    Rebuilding only shape/data/address dropped them. Nested split_grid data
+    is still unpacked.
+    """
+    inner = host_pack_data([[1, 2], [3, 4]], force="always")
+    env = {
+        "__wa_payload__": PAYLOAD_CALC_RANGE,
+        "shape": [2, 2],
+        "data": inner,
+        "address": "Sheet1.A1:B2",
+        "sheet": "Sheet1",
+    }
+    unpacked = host_unpack_data(env)
+    assert unpacked["sheet"] == "Sheet1"
+    assert unpacked["address"] == "Sheet1.A1:B2"
+    assert unpacked["shape"] == [2, 2]
+    assert unpacked["__wa_payload__"] == PAYLOAD_CALC_RANGE
+    assert unpacked["data"] == [[1, 2], [3, 4]]
+
+
 def test_dataframe_host_unpack_preserves_split_grid_for_numeric():
     np = pytest.importorskip("numpy")
     arr = np.array([[1.0, 2.0], [3.0, 4.0]])
@@ -946,64 +1543,6 @@ def test_dataframe_host_unpack_preserves_split_grid_for_numeric():
     assert unpacked["data"][0][0] == pytest.approx(1.0)
 
 
-def test_date_and_datetime_serialization_handling():
-    """Verify how dates and datetimes are handled when passing through the host/child bridge.
-    
-    This verifies that:
-    1. Python datetime/date objects below threshold (pickle list path) preserve their types.
-    2. Python datetime/date objects above threshold (split_grid) are coerced to strings on the wire.
-    3. NumPy datetime64 arrays serialized above threshold are cast to float64 (days/units since Epoch).
-    4. Pandas Timestamps are correctly coerced to strings under split_grid.
-    """
-    np = pytest.importorskip("numpy")
-    pd = pytest.importorskip("pandas")
-    import datetime
-
-    # 1. Below threshold (plain list path / pickle)
-    d = datetime.date(2026, 6, 25)
-    dt = datetime.datetime(2026, 6, 25, 14, 30, 0)
-    
-    wire_list = host_pack_data([d, dt], force="never")
-    child_unpacked_list = child_unpack_data(wire_list)
-    assert child_unpacked_list[0] == d
-    assert child_unpacked_list[1] == dt
-
-    # 2. Above threshold (split_grid / always binary)
-    grid = [[d, dt] * 50]  # 100 cells
-    wire_sg = host_pack_data(grid, force="always")
-    assert wire_sg["__wa_payload__"] == PAYLOAD_SPLIT_GRID
-    
-    # Verify they were treated as strings in the strings dict
-    assert 0 in wire_sg["strings"]
-    assert wire_sg["strings"][0] == "2026-06-25"
-    assert wire_sg["strings"][1] == "2026-06-25 14:30:00"
-
-    # Child unpacks them as strings
-    child_unpacked_sg = child_unpack_data(wire_sg)
-    assert isinstance(child_unpacked_sg, list)
-    assert child_unpacked_sg[0][0] == "2026-06-25"
-    assert child_unpacked_sg[0][1] == "2026-06-25 14:30:00"
-
-    # 3. NumPy np.datetime64 egress (above threshold)
-    arr = np.array([np.datetime64("2026-06-25"), np.datetime64("2026-06-26")])
-    wire_arr_sg = child_pack_result(arr, force="always")
-    assert wire_arr_sg["__wa_payload__"] == PAYLOAD_SPLIT_GRID
-    
-    host_unpacked_arr = host_unpack_data(wire_arr_sg)
-    # Internally cast to float64 representing days since Epoch (1970-01-01)
-    assert host_unpacked_arr[0] == 20629.0
-    assert host_unpacked_arr[1] == 20630.0
-
-    # 4. Pandas Timestamps under split_grid (above threshold)
-    ts = pd.Timestamp("2026-06-25 14:30:00")
-    grid_ts = [[ts] * 100]
-    wire_ts = host_pack_data(grid_ts, force="always")
-    assert wire_ts["__wa_payload__"] == PAYLOAD_SPLIT_GRID
-    assert wire_ts["strings"][0] == "2026-06-25 14:30:00"
-    
-    child_unpacked_ts = child_unpack_data(wire_ts)
-    assert child_unpacked_ts[0][0] == "2026-06-25 14:30:00"
-
 
 def test_invalidate_host_cython_accelerator_clears_globals_and_modules() -> None:
     import sys
@@ -1012,10 +1551,11 @@ def test_invalidate_host_cython_accelerator_clears_globals_and_modules() -> None
     prev_2d = payload_codec.fast_flatten_grid_2d
     prev_1d = payload_codec.fast_flatten_grid_1d
     prev_disabled = payload_codec._CYTHON_ACCELERATOR_DISABLED
-    saved_pack = sys.modules.get("splitgrid.pack")
+    real_pack = sys.modules.get("splitgrid.pack")
     fake = types.ModuleType("splitgrid.pack")
     fake.fast_flatten_grid_2d = object()
     sys.modules["splitgrid.pack"] = fake
+    sys.modules["splitgrid.pack.extra"] = types.ModuleType("splitgrid.pack.extra")
 
     try:
         payload_codec.fast_flatten_grid_2d = object()
@@ -1028,23 +1568,26 @@ def test_invalidate_host_cython_accelerator_clears_globals_and_modules() -> None
         assert payload_codec.fast_flatten_grid_1d is None
         assert payload_codec._CYTHON_ACCELERATOR_DISABLED is False
         assert "splitgrid.pack" not in sys.modules
+        assert "splitgrid.pack.extra" not in sys.modules
     finally:
         payload_codec.fast_flatten_grid_2d = prev_2d
         payload_codec.fast_flatten_grid_1d = prev_1d
         payload_codec._CYTHON_ACCELERATOR_DISABLED = prev_disabled
-        if saved_pack is not None:
-            sys.modules["splitgrid.pack"] = saved_pack
-        else:
-            sys.modules.pop("splitgrid.pack", None)
+        sys.modules.pop("splitgrid.pack", None)
+        sys.modules.pop("splitgrid.pack.extra", None)
+        if real_pack is not None:
+            sys.modules["splitgrid.pack"] = real_pack
 
 
 def test_host_cython_status_line_report_only_by_default() -> None:
     prev_2d = payload_codec.fast_flatten_grid_2d
     prev_loc = payload_codec._CYTHON_ACCELERATOR_LOCATION
+    prev_reason = payload_codec._CYTHON_ACCELERATOR_INACTIVE_REASON
     try:
         with patch.object(payload_codec, "reload_host_cython_accelerator") as mock_reload:
             payload_codec.fast_flatten_grid_2d = None
             payload_codec._CYTHON_ACCELERATOR_LOCATION = None
+            payload_codec._CYTHON_ACCELERATOR_INACTIVE_REASON = None
             line = payload_codec.host_cython_status_line()
             mock_reload.assert_not_called()
             assert line == "Cython Accelerator: Inactive (Pure Python)"
@@ -1056,6 +1599,417 @@ def test_host_cython_status_line_report_only_by_default() -> None:
     finally:
         payload_codec.fast_flatten_grid_2d = prev_2d
         payload_codec._CYTHON_ACCELERATOR_LOCATION = prev_loc
+        payload_codec._CYTHON_ACCELERATOR_INACTIVE_REASON = prev_reason
 
 
 
+def test_host_pack_data_tuple_rows() -> None:
+    # ensure it doesn't crash cython accelerator due to PyList_GET_ITEM on tuple
+    grid = [(1.0, 2.0), (3.0, 4.0)]
+    try:
+        import splitgrid.codec as payload_codec
+        orig_2d = payload_codec.fast_flatten_grid_2d
+
+        payload_codec._CYTHON_ACCELERATOR_DISABLED = False
+        payload_codec.fast_flatten_grid_2d = None
+        payload_codec.load_cython_accelerator()
+
+        # Will crash if bug is present
+        wire = host_pack_data(grid, force="always")
+
+        # Verify it packed properly
+        assert is_split_grid(wire)
+        arr, str_map, types, shape = payload_codec._flatten_grid_to_components(grid)
+        assert shape == [2, 2]
+    finally:
+        payload_codec.fast_flatten_grid_2d = orig_2d
+
+def test_host_pack_data_numpy_str() -> None:
+    np = pytest.importorskip("numpy")
+    grid = [["0123", np.str_("0123")]]
+
+    import splitgrid.codec as payload_codec
+    orig_2d = payload_codec.fast_flatten_grid_2d
+
+    try:
+        # stdlib test
+        payload_codec.fast_flatten_grid_2d = None
+        arr, str_map, types, shape = payload_codec._flatten_grid_to_components(grid)
+        assert str_map[0] == "0123"
+        assert str_map[1] == "0123"
+        # np.str_ must not ride the strings map; host pickle has no NumPy.
+        assert type(str_map[0]) is str
+        assert type(str_map[1]) is str
+
+        # accel test
+        payload_codec._CYTHON_ACCELERATOR_DISABLED = False
+        payload_codec.fast_flatten_grid_2d = None
+        payload_codec.load_cython_accelerator()
+
+        if payload_codec.fast_flatten_grid_2d is not None:
+            arr, str_map, types, shape = payload_codec._flatten_grid_to_components(grid)
+            assert str_map[0] == "0123"
+            assert str_map[1] == "0123"
+            assert type(str_map[0]) is str
+            assert type(str_map[1]) is str
+    finally:
+        payload_codec.fast_flatten_grid_2d = orig_2d
+
+
+def test_child_pack_result_dict_key_collision_raises() -> None:
+    """{1: "a", "1": "b"} must not silently drop "a" when keys are stringified."""
+    with pytest.raises(ValueError, match="collide"):
+        child_pack_result({1: "a", "1": "b"})
+    assert child_pack_result({1: "a"}) == {"1": "a"}
+
+
+def test_split_grid_unpack_rejects_non_str_string_value() -> None:
+    envelope = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [1],
+        "buffer": array.array("d", [1.0]).tobytes(),
+        "strings": {0: 5},
+    }
+    with pytest.raises(ValueError, match="must be str"):
+        host_unpack_split_grid(envelope)
+
+
+def test_host_unpack_int_column_inf_raises() -> None:
+    """A corrupt int column containing inf is OverflowError, not a swallowed contract miss."""
+    wire = payload_codec.host_pack_split_grid([[1, 2], [3, 4]])
+    buf = array.array("d")
+    buf.frombytes(wire["buffer"])
+    buf[0] = float("inf")
+    wire["buffer"] = buf.tobytes()
+    with pytest.raises(OverflowError):
+        host_unpack_split_grid(wire)
+
+
+def test_flatten_rejects_jagged_before_accelerator() -> None:
+    """Jagged rows raise even if a native flattener would pad them."""
+    called: list[bool] = []
+
+    def fake_flatten(_grid: list, _ncols: int):
+        called.append(True)
+        return array.array("d", [1.0, 2.0, 3.0]), {}, [0, 0], [False, False], False
+
+    orig = payload_codec.fast_flatten_grid_2d
+    payload_codec.fast_flatten_grid_2d = fake_flatten
+    try:
+        with pytest.raises(ValueError, match="Uneven"):
+            payload_codec._flatten_grid_to_components([[1, 2], [3]])
+    finally:
+        payload_codec.fast_flatten_grid_2d = orig
+    assert called == []
+
+
+def test_flatten_falls_back_when_accelerator_length_mismatches() -> None:
+    """A short accelerator buffer must not replace the stdlib flatten."""
+
+    def fake_flatten(_grid: list, _ncols: int):
+        return array.array("d", [9.0]), {}, [3], [False], False
+
+    orig = payload_codec.fast_flatten_grid_2d
+    payload_codec.fast_flatten_grid_2d = fake_flatten
+    try:
+        buf, _strings, kinds, shape = payload_codec._flatten_grid_to_components([[1, 2]])
+    finally:
+        payload_codec.fast_flatten_grid_2d = orig
+    assert shape == [1, 2]
+    assert len(buf) == 2
+    assert list(buf) == [1.0, 2.0]
+    assert kinds == ["int", "int"]
+
+
+def test_flatten_1d_falls_back_when_accelerator_length_mismatches() -> None:
+    """A short 1D native buffer must not replace the stdlib flatten."""
+
+    def fake_flatten(_grid: list):
+        return array.array("d", [9.0]), {}, [3], [False], False
+
+    orig = payload_codec.fast_flatten_grid_1d
+    payload_codec.fast_flatten_grid_1d = fake_flatten
+    try:
+        buf, _strings, kinds, shape = payload_codec._flatten_grid_to_components([1, 2, 3])
+    finally:
+        payload_codec.fast_flatten_grid_1d = orig
+    assert shape == [3]
+    assert list(buf) == [1.0, 2.0, 3.0]
+    assert kinds == ["int"]
+
+
+def test_child_pack_list_of_grids_does_not_stringify_cells() -> None:
+    """A rectangular list of grids is not one split_grid of str(cell)."""
+    nested = [[[i], [i]] for i in range(60)]
+    back = host_unpack_data(child_pack_result(nested))
+    assert back[0] == [[0], [0]]
+    assert back[59] == [[59], [59]]
+    small = [[[i], [i]] for i in range(10)]
+    assert child_pack_result(small) == small
+
+
+def test_wire_cell_count_cycle_raises() -> None:
+    """A self-referential multi_data raises ValueError, and the log summary does not."""
+    wire: dict[str, object] = {"__wa_payload__": PAYLOAD_MULTI_DATA, "items": []}
+    items = wire["items"]
+    assert isinstance(items, list)
+    items.append(wire)
+    with pytest.raises(ValueError, match="maximum recursion depth"):
+        wire_cell_count(wire)
+    assert "cells=?" in describe_wire_value(wire)
+
+
+def test_child_pack_rank3_is_list_of_planes() -> None:
+    """Rank 3+ is not a split_grid envelope. Each plane packs on its own."""
+    np = pytest.importorskip("numpy")
+    arr = np.arange(125).reshape(5, 5, 5)
+    packed = child_pack_result(arr, force="always")
+    assert isinstance(packed, list)
+    assert len(packed) == 5
+    assert is_split_grid(packed) is False
+    assert is_split_grid(packed[0]) is True
+    back = host_unpack_data(packed)
+    assert back[0][0][0] == 0
+    assert back[4][4][4] == 124
+
+    small = child_pack_result(np.arange(8).reshape(2, 2, 2))
+    assert small == [[[0, 1], [2, 3]], [[4, 5], [6, 7]]]
+
+
+def test_child_pack_split_grid_rejects_rank_and_complex() -> None:
+    np = pytest.importorskip("numpy")
+    with pytest.raises(ValueError, match="rank 1 or 2"):
+        payload_codec.child_pack_split_grid(np.zeros((2, 2, 2)))
+    with pytest.raises(ValueError, match="i/u/f/b"):
+        payload_codec.child_pack_split_grid(np.zeros((2, 2), dtype=complex))
+    assert child_pack_result(np.array(3), force="always") == 3
+
+
+def test_child_pack_complex_keeps_imaginary_part() -> None:
+    """astype(float64) used to keep only the real part."""
+    np = pytest.importorskip("numpy")
+    arr = np.array([[1 + 2j, 3 + 4j], [5 + 6j, 7 + 8j]])
+    wire = child_pack_result(arr, force="always")
+    assert is_split_grid(wire)
+    back = host_unpack_data(wire)
+    assert back[0][0] == "(1+2j)"
+    assert back[1][1] == "(7+8j)"
+
+
+def test_host_unpack_nonuniform_bool_two_is_false() -> None:
+    """A bool-tagged 2.0 is False on the mixed path, matching the uniform path. NaN stays NaN."""
+    two = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "dtype": "float64",
+        "shape": [1, 2],
+        "buffer": array.array("d", [2.0, 1.5]).tobytes(),
+        "strings": {},
+        "column_kinds": ["bool", "float"],
+    }
+    assert host_unpack_split_grid(two) == [[False, 1.5]]
+    nan_env = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "dtype": "float64",
+        "shape": [1, 2],
+        "buffer": array.array("d", [float("nan"), 1.5]).tobytes(),
+        "strings": {},
+        "column_kinds": ["bool", "float"],
+    }
+    unpacked = host_unpack_split_grid(nan_env)
+    assert math.isnan(unpacked[0][0])
+    assert unpacked[0][1] == 1.5
+
+
+def test_flatten_overflow_int_is_text_on_both_paths() -> None:
+    """A plain int past ~1e308 is text. float() used to raise OverflowError.
+
+    The fast lane is a numeric cell with no earlier string. An earlier string
+    forces the slow lane. Both ranks, both signs, stdlib and the accelerator.
+    """
+    from splitgrid.codec import host_pack_split_grid
+
+    huge = 10**400
+    neg = -huge
+
+    def _check() -> None:
+        alone = host_pack_split_grid([[huge, neg]])
+        assert alone["strings"][0] == str(huge)
+        assert alone["strings"][1] == str(neg)
+        assert host_unpack_split_grid(alone) == [[str(huge), str(neg)]]
+
+        mixed = host_pack_split_grid([["02138", huge], [neg, "x"]])
+        assert mixed["strings"][1] == str(huge)
+        assert mixed["strings"][2] == str(neg)
+        assert host_unpack_split_grid(mixed) == [["02138", str(huge)], [str(neg), "x"]]
+
+        flat = host_pack_split_grid([huge, 1, neg])
+        assert flat["strings"][0] == str(huge)
+        assert flat["strings"][2] == str(neg)
+        assert 1 not in flat["strings"]
+        assert host_unpack_split_grid(flat) == [str(huge), 1, str(neg)]
+
+        after_text = host_pack_split_grid(["zip", neg])
+        assert after_text["strings"][0] == "zip"
+        assert after_text["strings"][1] == str(neg)
+
+    with cython_accelerator_context(enabled=False):
+        _check()
+    if payload_codec.fast_flatten_grid_1d is not None:
+        _check()
+
+
+
+
+def test_flatten_overflow_fraction_is_text_without_accelerator() -> None:
+    """A huge Fraction is text on the stdlib path, matching Cython _flatten_cell.
+
+    The fast path catches OverflowError and retries the slow helper. An earlier
+    text cell forces the slow path directly. Both used to raise.
+    """
+    from fractions import Fraction
+
+    huge = Fraction(10**309)
+    orig = payload_codec.fast_flatten_grid_2d
+    payload_codec.fast_flatten_grid_2d = None
+    try:
+        alone = payload_codec.host_pack_split_grid([[huge]])
+        assert alone["strings"][0] == str(huge)
+        mixed = payload_codec.host_pack_split_grid([["02138", huge]])
+        assert mixed["strings"][0] == "02138"
+        assert mixed["strings"][1] == str(huge)
+    finally:
+        payload_codec.fast_flatten_grid_2d = orig
+
+
+def test_split_grid_unpack_rejects_duplicate_stringified_keys() -> None:
+    """Keys that int() to the same index (1 and \"1\") must not last-wins."""
+    pytest.importorskip("numpy")
+    envelope = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "shape": [2],
+        "buffer": array.array("d", [float("nan"), 1.0]).tobytes(),
+        "strings": {0: "a", "0": "b"},
+        "column_kinds": ["float"],
+    }
+    with pytest.raises(ValueError, match="collide"):
+        host_unpack_split_grid(envelope)
+    with pytest.raises(ValueError, match="collide"):
+        child_unpack_split_grid(envelope)
+
+
+def test_child_unpack_plain_dict_unpacks_nested_split_grid() -> None:
+    """A split_grid nested in a plain dict unpacks. A nested list stays a list."""
+    np = pytest.importorskip("numpy")
+    grid = [[float(i)] for i in range(4)]
+    out = child_unpack_data({"label": host_pack_data(grid, force="always")})
+    assert isinstance(out["label"], np.ndarray)
+    assert out["label"].shape == (4, 1)
+    assert child_unpack_data({"changes": [[1.0, 2.0]]}) == {"changes": [[1.0, 2.0]]}
+
+
+def test_host_pack_empty_rows_skip_binary_shortcut() -> None:
+    """Zero-width rows are not a split_grid. A non-empty first row still is."""
+    empty = [[] for _ in range(BINARY_MIN_CELLS)]
+    assert not is_split_grid(host_pack_data(empty, force="auto"))
+    filled = [[1.0] for _ in range(BINARY_MIN_CELLS)]
+    assert is_split_grid(host_pack_data(filled, force="auto"))
+
+
+def test_child_pack_namedtuple_of_ndarrays_is_plain_tuple() -> None:
+    """Tuple subclasses collapse to tuple and do not call type(obj)(items)."""
+    from collections import namedtuple
+
+    np = pytest.importorskip("numpy")
+    Point = namedtuple("Point", "x y")
+    arr = np.zeros((4, 4))
+    out = child_pack_result(Point(arr, arr), force="always")
+    assert type(out) is tuple
+    assert len(out) == 2
+    assert is_split_grid(out[0])
+    assert is_split_grid(out[1])
+    unpacked = host_unpack_data(Point(1, 2))
+    assert type(unpacked) is tuple
+    assert unpacked == (1, 2)
+
+
+def test_host_unpack_depth_cap_raises_before_recursion_error() -> None:
+    """The cap stays under the default recursion limit, so a cycle is ValueError."""
+    from splitgrid.codec import _MAX_UNPACK_DEPTH
+
+    nested: object = 0
+    for unused in range(_MAX_UNPACK_DEPTH):
+        nested = [nested]
+    out = host_unpack_data(nested)
+    for unused in range(_MAX_UNPACK_DEPTH):
+        assert isinstance(out, list) and len(out) == 1
+        out = out[0]
+    assert out == 0
+
+    one_past: object = 0
+    for unused in range(_MAX_UNPACK_DEPTH + 1):
+        one_past = [one_past]
+    with pytest.raises(ValueError, match="maximum recursion depth"):
+        host_unpack_data(one_past)
+
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match="maximum recursion depth"):
+        host_unpack_data(cyclic)
+
+
+def test_find_image_payloads_shared_image_and_wrapper() -> None:
+    """A shared image dict counts twice. A shared wrapper is walked once."""
+    from splitgrid.codec import PAYLOAD_IMAGE, find_image_payloads
+
+    img = {"__wa_payload__": PAYLOAD_IMAGE, "data": b"png", "format": "png"}
+    assert find_image_payloads({"a": img, "b": img}) == [img, img]
+    box = {"image": img}
+    assert find_image_payloads({"a": box, "b": box}) == [img]
+
+
+def test_write_image_payload_to_temp_unlinks_when_write_fails() -> None:
+    """delete=False used to leave the file when data was not bytes."""
+    import os
+    import tempfile
+
+    from splitgrid.codec import write_image_payload_to_temp
+
+    created: list[str] = []
+    real = tempfile.NamedTemporaryFile
+
+    def _tracking(*args, **kwargs):
+        tmp = real(*args, **kwargs)
+        created.append(tmp.name)
+        return tmp
+
+    with patch("splitgrid.codec.tempfile.NamedTemporaryFile", _tracking):
+        with pytest.raises(TypeError):
+            write_image_payload_to_temp({"data": object(), "format": "png"})
+    assert len(created) == 1
+    assert not os.path.exists(created[0])
+
+
+def test_mixed_int_float_child_stays_float64_host_emits_ints() -> None:
+    """Empty-strings mixed kinds: child is one float64 view; host ints the int column.
+
+    normalize_for_oracle turns integral floats into int, so the A/B suite
+    does not catch this. A homogeneous ndarray cannot store both dtypes.
+    """
+    np = pytest.importorskip("numpy")
+    envelope = {
+        "__wa_payload__": PAYLOAD_SPLIT_GRID,
+        "dtype": "float64",
+        "shape": [1, 2],
+        "buffer": array.array("d", [2.0, 1.5]).tobytes(),
+        "strings": {},
+        "column_kinds": ["int", "float"],
+    }
+    child = child_unpack_split_grid(envelope)
+    assert isinstance(child, np.ndarray)
+    assert child.dtype == np.float64
+    assert child.flags.writeable is False
+    assert float(child[0, 0]) == 2.0
+    assert float(child[0, 1]) == 1.5
+    host = host_unpack_split_grid(envelope)
+    assert host == [[2, 1.5]]
+    assert type(host[0][0]) is int

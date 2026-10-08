@@ -6,10 +6,10 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Verification and contract tests for split-grid serialization.
+"""Verification and contract tests for payload_codec split_grid serialization.
 
-Default pytest runs deal contracts + hypothesis round-trips. CrossHair
-subprocess checks are marked ``slow``.
+Excluded from default ``make test`` (CrossHair can take minutes). Run: ``make slowtests``
+(contracts + CrossHair here; extensive A/B Hypothesis in ``test_serialization_ab.py``).
 """
 
 from __future__ import annotations
@@ -21,6 +21,8 @@ from pathlib import Path
 
 import deal
 import pytest
+
+pytestmark = pytest.mark.slow
 
 from hypothesis import given, strategies as st
 
@@ -123,6 +125,25 @@ def test_serialization_contracts_runtime_and_invariants() -> None:
             assert child_unpacked is not None
 
 
+def test_child_unpack_split_grid_1d_rejects_short_buffer() -> None:
+    """1D child unpack must reject a buffer shorter than the declared shape.
+
+    Host unpack already raises. The 1D child path used to skip reshape and
+    return an ndarray of the buffer's own length.
+    """
+    pytest.importorskip("numpy")
+    import numpy as np
+
+    raw = np.array([1.0, 2.0], dtype=np.float64).tobytes()
+    # deal.pre requires a split_grid envelope. Copy a real pack and only
+    # change shape and buffer so the short 1D buffer reaches the unpack body.
+    envelope = host_pack_split_grid([1.0, 2.0, 3.0, 4.0])
+    envelope["shape"] = [4]
+    envelope["buffer"] = raw
+    with pytest.raises(ValueError, match="needs 4"):
+        child_unpack_split_grid(envelope)
+
+
 def test_jagged_grid_raises_value_error() -> None:
     """Jagged 2D grids must raise ValueError via @deal.raises on _flatten_grid_to_components."""
     jagged = [[1.0, 2.0], [3.0]]
@@ -135,12 +156,16 @@ def test_column_kinds_for_grid_contract_kinds() -> None:
     assert column_kinds_for_grid([]) == []
     assert column_kinds_for_grid([0]) == ["int"]
     kinds = column_kinds_for_grid([[1, "x", True], [2, "y", False]])
-    assert kinds == ["int", "int", "bool"]
+    assert kinds == ["int", "float", "bool"]
     assert all(k in ("int", "float", "bool") for k in kinds)
 
 
 def test_should_use_binary_envelope_force_contracts() -> None:
-    """force=always/never overrides cell threshold (deal.ensure); cover-style empty shape."""
+    """force=always/never overrides cell threshold (deal.ensure); cover-style empty shape.
+
+    Empty tuple must stay False under force=auto (len, not bool(shape) — CrossHair
+    SymbolicBool TypeError on check-all deep 32900105768). (0,) is a non-empty shape.
+    """
     assert should_use_binary_envelope((), force="always") is True
     assert should_use_binary_envelope((BINARY_MIN_CELLS,), force="never") is False
     assert should_use_binary_envelope((), min_cells=0, force="auto") is False
@@ -186,8 +211,8 @@ def test_host_pack_multi_data_structure_and_roundtrip() -> None:
     assert envelope.get("__wa_payload__") == PAYLOAD_MULTI_DATA
     items = envelope["items"]
     assert len(items) == len(grids)
-    # host_pack_data skips falsy/empty grids even with force="always"
-    assert items[0] == []
+    # Empty host pack stays a list even with force=always (`if grid` in host_pack_data).
+    assert is_split_grid(items[0]) is False
     assert all(is_split_grid(item) for item in items[1:])
 
     unpacked = host_unpack_data(envelope)
